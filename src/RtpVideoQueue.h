@@ -2,12 +2,15 @@
 
 #include "Video.h"
 
+#include <stdatomic.h>
+
 typedef struct _RTPV_QUEUE_ENTRY {
     struct _RTPV_QUEUE_ENTRY* next;
     struct _RTPV_QUEUE_ENTRY* prev;
     PRTP_PACKET packet;
-    uint64_t receiveTimeMs;
-    uint32_t presentationTimeMs;
+    uint64_t receiveTimeUs;
+    uint64_t presentationTimeUs;
+    uint32_t rtpTimestamp;
     int length;
     bool isParity;
 } RTPV_QUEUE_ENTRY, *PRTPV_QUEUE_ENTRY;
@@ -18,11 +21,21 @@ typedef struct _RTPV_QUEUE_LIST {
     uint32_t count;
 } RTPV_QUEUE_LIST, *PRTPV_QUEUE_LIST;
 
+typedef struct _RTP_VIDEO_QUEUE_STATS {
+    atomic_uint packetCountVideo;
+    atomic_uint packetCountFec;
+    atomic_uint packetCountFecRecovered;
+    atomic_uint packetCountFecFailed;
+    atomic_uint packetCountOOS;
+    atomic_uint packetCountInvalid;
+    atomic_uint packetCountFecInvalid;
+} RTP_VIDEO_QUEUE_STATS, *PRTP_VIDEO_QUEUE_STATS;
+
 typedef struct _RTP_VIDEO_QUEUE {
     RTPV_QUEUE_LIST pendingFecBlockList;
     RTPV_QUEUE_LIST completedFecBlockList;
 
-    uint64_t bufferFirstRecvTimeMs;
+    uint64_t bufferFirstRecvTimeUs;
     uint32_t bufferLowestSequenceNumber;
     uint32_t bufferHighestSequenceNumber;
     uint32_t bufferFirstParitySequenceNumber;
@@ -43,8 +56,10 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint8_t multiFecCurrentBlockNumber;
     uint8_t multiFecLastBlockNumber;
 
-    uint32_t lastOosFramePresentationTimestamp;
+    uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
+
+    RTP_VIDEO_QUEUE_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 
 #define RTPF_RET_QUEUED    0
@@ -55,3 +70,4 @@ void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
+void RtpvGetStats(PRTP_VIDEO_QUEUE queue, PRTP_VIDEO_STATS stats);

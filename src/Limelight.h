@@ -154,21 +154,25 @@ typedef struct _DECODE_UNIT {
     // (happens when the frame is repeated).
     uint16_t frameHostProcessingLatency;
 
-    // Receive time of first buffer. This value uses an implementation-defined epoch,
-    // but the same epoch as enqueueTimeMs and LiGetMillis().
-    uint64_t receiveTimeMs;
+    // Receive time of first buffer in microseconds.
+    uint64_t receiveTimeUs;
 
     // Time the frame was fully assembled and queued for the video decoder to process.
     // This is also approximately the same time as the final packet was received, so
-    // enqueueTimeMs - receiveTimeMs is the time taken to receive the frame. At the
+    // enqueueTimeUs - receiveTimeUs is the time taken to receive the frame. At the
     // time the decode unit is passed to submitDecodeUnit(), the total queue delay
-    // can be calculated by LiGetMillis() - enqueueTimeMs.
-    uint64_t enqueueTimeMs;
+    // can be calculated. This value is in microseconds.
+    uint64_t enqueueTimeUs;
 
-    // Presentation time in milliseconds with the epoch at the first captured frame.
+    // Presentation time in microseconds with the epoch at the first captured frame.
     // This can be used to aid frame pacing or to drop old frames that were queued too
     // long prior to display.
-    unsigned int presentationTimeMs;
+    uint64_t presentationTimeUs;
+
+    // Original RTP timestamp in 90kHz units. Useful when using APIs that deal with integer
+    // time such as Apple's CMTime. To exactly recover the RTP timestamp, use something like
+    // CMTimeMake((int64_t)du->rtpTimestamp, 90000);
+    uint32_t rtpTimestamp;
 
     // Length of the entire buffer chain in bytes
     int fullLength;
@@ -218,23 +222,27 @@ typedef struct _DECODE_UNIT {
 
 // Passed in StreamConfiguration.supportedVideoFormats to specify supported codecs
 // and to DecoderRendererSetup() to specify selected codec.
-#define VIDEO_FORMAT_H264            0x0001 // H.264 High Profile
-#define VIDEO_FORMAT_H264_HIGH8_444  0x0004 // H.264 High 4:4:4 8-bit Profile
-#define VIDEO_FORMAT_H265            0x0100 // HEVC Main Profile
-#define VIDEO_FORMAT_H265_MAIN10     0x0200 // HEVC Main10 Profile
-#define VIDEO_FORMAT_H265_REXT8_444  0x0400 // HEVC RExt 4:4:4 8-bit Profile
-#define VIDEO_FORMAT_H265_REXT10_444 0x0800 // HEVC RExt 4:4:4 10-bit Profile
-#define VIDEO_FORMAT_AV1_MAIN8       0x1000 // AV1 Main 8-bit profile
-#define VIDEO_FORMAT_AV1_MAIN10      0x2000 // AV1 Main 10-bit profile
-#define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
-#define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
+#define VIDEO_FORMAT_H264            0x00000001 // H.264 High Profile
+#define VIDEO_FORMAT_H264_HIGH8_444  0x00000004 // H.264 High 4:4:4 8-bit Profile
+#define VIDEO_FORMAT_H265            0x00000100 // HEVC Main Profile
+#define VIDEO_FORMAT_H265_MAIN10     0x00000200 // HEVC Main10 Profile
+#define VIDEO_FORMAT_H265_REXT8_444  0x00000400 // HEVC RExt 4:4:4 8-bit Profile
+#define VIDEO_FORMAT_H265_REXT10_444 0x00000800 // HEVC RExt 4:4:4 10-bit Profile
+#define VIDEO_FORMAT_AV1_MAIN8       0x00001000 // AV1 Main 8-bit profile
+#define VIDEO_FORMAT_AV1_MAIN10      0x00002000 // AV1 Main 10-bit profile
+#define VIDEO_FORMAT_AV1_HIGH8_444   0x00004000 // AV1 High 4:4:4 8-bit profile
+#define VIDEO_FORMAT_AV1_HIGH10_444  0x00008000 // AV1 High 4:4:4 10-bit profile
+#define VIDEO_FORMAT_MPEG2           0x00010000 // MPEG-2/H.262 video (Sunshine protocol extension)
+#define VIDEO_FORMAT_H263P           0x00040000 // H.263+ video (Sunshine protocol extension)
 
 // Masks for clients to use to match video codecs without profile-specific details.
-#define VIDEO_FORMAT_MASK_H264   0x000F
-#define VIDEO_FORMAT_MASK_H265   0x0F00
-#define VIDEO_FORMAT_MASK_AV1    0xF000
-#define VIDEO_FORMAT_MASK_10BIT  0xAA00
-#define VIDEO_FORMAT_MASK_YUV444 0xCC04
+#define VIDEO_FORMAT_MASK_H264   0x0000000F
+#define VIDEO_FORMAT_MASK_H265   0x00000F00
+#define VIDEO_FORMAT_MASK_AV1    0x0000F000
+#define VIDEO_FORMAT_MASK_MPEG2  0x00010000
+#define VIDEO_FORMAT_MASK_H263P  0x00040000
+#define VIDEO_FORMAT_MASK_10BIT  0x0000AA00
+#define VIDEO_FORMAT_MASK_YUV444 0x0000CC04
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
 // be submitted directly from the receive thread. This should only be specified if the
@@ -271,6 +279,10 @@ typedef struct _DECODE_UNIT {
 // If set in the video renderer capabilities field, this flag specifies that the renderer
 // supports reference frame invalidation for AV1 streams. This flag is only valid on video renderers.
 #define CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 0x40
+
+// If set in the video renderer capabilities field, this flag specifies that the renderer
+// needs to opt-in to intra refresh, some clients (like the Xbox client with NVEnc) needs it
+#define CAPABILITY_INTRA_REFRESH 0x80
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
@@ -509,11 +521,15 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_HEVC_REXT10_444 0x00100000 // Sunshine extension
 #define SCM_AV1_HIGH8_444   0x00200000 // Sunshine extension
 #define SCM_AV1_HIGH10_444  0x00400000 // Sunshine extension
+#define SCM_MPEG2           0x00800000 // Sunshine protocol extension
+#define SCM_H263P           0x02000000 // Sunshine protocol extension
 
 // SCM masks to identify various codec capabilities
 #define SCM_MASK_H264   (SCM_H264 | SCM_H264_HIGH8_444)
 #define SCM_MASK_HEVC   (SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
 #define SCM_MASK_AV1    (SCM_AV1_MAIN8 | SCM_AV1_MAIN10 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
+#define SCM_MASK_MPEG2  SCM_MPEG2
+#define SCM_MASK_H263P  SCM_H263P
 #define SCM_MASK_10BIT  (SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444 | SCM_AV1_MAIN10 | SCM_AV1_HIGH10_444)
 #define SCM_MASK_YUV444 (SCM_H264_HIGH8_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
 
@@ -697,12 +713,17 @@ int LiSendMouseButtonEvent(char action, int button);
 // This function queues a keyboard event to be sent to the remote server.
 // Key codes are Win32 Virtual Key (VK) codes and interpreted as keys on
 // a US English layout.
+//
+// MODIFIER_EXTENDED indicates an extended key (0xE0 scancode prefix).
+// This is required to distinguish between certain keys like Enter
+// and Numpad Enter that share the same VK code.
 #define KEY_ACTION_DOWN 0x03
 #define KEY_ACTION_UP 0x04
 #define MODIFIER_SHIFT 0x01
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
 #define MODIFIER_META 0x08
+#define MODIFIER_EXTENDED 0x10
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Similar to LiSendKeyboardEvent() but allows the client to inform the host that
@@ -760,7 +781,7 @@ int LiSendControllerEvent(int buttonFlags, unsigned char leftTrigger, unsigned c
 //
 // To indicate removal of a gamepad, send an empty event with the controller number set to the
 // removed controller and the bit of the removed controller cleared in the active gamepad mask.
-int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
+int LiSendMultiControllerEvent(uint8_t controllerNumber, uint16_t activeGamepadMask,
     int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
     short leftStickX, short leftStickY, short rightStickX, short rightStickY);
 
@@ -776,6 +797,7 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CTYPE_XBOX     0x01
 #define LI_CTYPE_PS       0x02
 #define LI_CTYPE_NINTENDO 0x03
+#define LI_CTYPE_STEAM    0x04 // Valve Steam Controller (Xbox-style layout plus dual touchpads, gyro/accel and grip buttons)
 #define LI_CCAP_ANALOG_TRIGGERS 0x01 // Reports values between 0x00 and 0xFF for trigger axes
 #define LI_CCAP_RUMBLE          0x02 // Can rumble in response to ConnListenerRumble() callback
 #define LI_CCAP_TRIGGER_RUMBLE  0x04 // Can rumble triggers in response to ConnListenerRumbleTriggers() callback
@@ -784,6 +806,7 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CCAP_GYRO            0x20 // Can report gyroscope events via LiSendControllerMotionEvent()
 #define LI_CCAP_BATTERY_STATE   0x40 // Reports battery state via LiSendControllerBatteryEvent()
 #define LI_CCAP_RGB_LED         0x80 // Can set RGB LED state via ConnListenerSetControllerLED()
+#define LI_CCAP_DUAL_TOUCHPAD  0x100 // Reports touchpad events from 2 separate touchpads
 int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepadMask, uint8_t type,
                                  uint32_t supportedButtonFlags, uint16_t capabilities);
 
@@ -796,6 +819,13 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepa
 // To determine if LiSendControllerTouchEvent() is supported without calling it, call LiGetHostFeatureFlags()
 // and check for the LI_FF_CONTROLLER_TOUCH_EVENTS flag.
 int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType, uint32_t pointerId, float x, float y, float pressure);
+
+// This function is similar to LiSendControllerTouchEvent(), but it allows the touchpad index to be
+// provided for use with controllers that have multiple touchpads (like the Steam Controller).
+//
+// The only valid touchpad indices are currently 0 (support indicated by LI_CCAP_TOUCHPAD) and 1
+// (support indicated by LI_CCAP_DUAL_TOUCHPAD).
+int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uint8_t touchpadIndex, uint32_t pointerId, float x, float y, float pressure);
 
 // This function allows clients to send controller-associated motion events to a supported host.
 //
@@ -840,7 +870,12 @@ int LiSendHighResScrollEvent(short scrollAmount);
 int LiSendHScrollEvent(signed char scrollClicks);
 int LiSendHighResHScrollEvent(short scrollAmount);
 
+// This function returns a time in microseconds with an implementation-defined epoch.
+// It should only ever be compared with the return value from a previous call to itself.
+uint64_t LiGetMicroseconds(void);
+
 // This function returns a time in milliseconds with an implementation-defined epoch.
+// It should only ever be compared with the return value from a previous call to itself.
 uint64_t LiGetMillis(void);
 
 // This is a simplistic STUN function that can assist clients in getting the WAN address
@@ -862,6 +897,34 @@ int LiGetPendingAudioFrames(void);
 // milliseconds rather than frames, which allows callers to be agnostic of the
 // negotiated audio frame duration.
 int LiGetPendingAudioDuration(void);
+
+// Populates a caller-supplied struct containing various statistics about the RTP audio stream.
+typedef struct _RTP_AUDIO_STATS {
+    uint32_t packetCountAudio;         // total audio packets
+    uint32_t packetCountFec;           // total packets of type FEC
+    uint32_t packetCountFecRecovered;  // a packet was saved
+    uint32_t packetCountFecFailed;     // tried to recover but too much was lost
+    uint32_t packetCountOOS;           // out-of-sequence packets
+    uint32_t packetCountInvalid;       // corrupted packets, etc
+    uint32_t packetCountFecInvalid;    // invalid FEC packet
+} RTP_AUDIO_STATS, *PRTP_AUDIO_STATS;
+
+void LiGetRTPAudioStats(PRTP_AUDIO_STATS stats);
+
+// Populates a caller-supplied struct containing various statistics about the RTP video stream.
+// Right now this is mainly used to track total video and FEC packets, as there are
+// many video stats already implemented at a higher level in moonlight-qt.
+typedef struct _RTP_VIDEO_STATS {
+    uint32_t packetCountVideo;         // total video packets
+    uint32_t packetCountFec;           // total packets of type FEC
+    uint32_t packetCountFecRecovered;  // a packet was saved
+    uint32_t packetCountFecFailed;     // tried to recover but too much was lost
+    uint32_t packetCountOOS;           // out-of-sequence packets
+    uint32_t packetCountInvalid;       // corrupted packets, etc
+    uint32_t packetCountFecInvalid;    // invalid FEC packet
+} RTP_VIDEO_STATS, *PRTP_VIDEO_STATS;
+
+void LiGetRTPVideoStats(PRTP_VIDEO_STATS stats);
 
 // Port index flags for use with LiGetPortFromPortFlagIndex() and LiGetProtocolFromPortFlagIndex()
 #define ML_PORT_INDEX_TCP_47984 0
@@ -890,7 +953,7 @@ int LiGetPendingAudioDuration(void);
 unsigned int LiGetPortFlagsFromStage(int stage);
 unsigned int LiGetPortFlagsFromTerminationErrorCode(int errorCode);
 
-// Returns the IPPROTO_* value for the specified port index 
+// Returns the IPPROTO_* value for the specified port index
 int LiGetProtocolFromPortFlagIndex(int portFlagIndex);
 
 // Returns the port number for the specified port index
@@ -924,7 +987,6 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
 typedef void* VIDEO_FRAME_HANDLE;
 bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
-bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit);
 void LiWakeWaitForVideoFrame(void);
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus);
 

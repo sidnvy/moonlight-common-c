@@ -1,4 +1,6 @@
+#include "VideoFormats.h"
 #include "Limelight-internal.h"
+#include <inttypes.h>
 
 #define MAX_OPTION_NAME_LEN 128
 
@@ -269,7 +271,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
-        snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
+        snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
@@ -299,7 +301,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             EncryptionFeaturesEnabled |= SS_ENC_AUDIO;
         }
 
-        snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
+        snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
         // Enable YUV444 if requested
@@ -308,6 +310,13 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         }
         else {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "0");
+        }
+
+        // Add intra-refresh if opted in
+        if (VideoCallbacks.capabilities & CAPABILITY_INTRA_REFRESH){
+            err |= addAttributeString(&optionHead, "x-ss-video[0].intraRefresh", "1");
+        } else {
+            err |= addAttributeString(&optionHead, "x-ss-video[0].intraRefresh", "0");
         }
     }
 
@@ -430,8 +439,13 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         snprintf(payloadStr, sizeof(payloadStr), "%d", slicesPerFrame);
         err |= addAttributeString(&optionHead, "x-nv-video[0].videoEncoderSlicesPerFrame", payloadStr);
 
-        if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
-            err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "2");
+        if (NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_MPEG2 | VIDEO_FORMAT_MASK_H263P)) {
+            // Sunshine codec extensions use GameStream framing and shared wire identifiers.
+            snprintf(payloadStr, sizeof(payloadStr), "%d", getVideoBitStreamFormat(NegotiatedVideoFormat));
+            if (NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_MPEG2 | VIDEO_FORMAT_MASK_H263P)) {
+                err |= addAttributeString(&optionHead, "x-nv-clientSupportHevc", "0");
+            }
+            err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", payloadStr);
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {
             err |= addAttributeString(&optionHead, "x-nv-clientSupportHevc", "1");

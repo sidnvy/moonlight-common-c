@@ -15,7 +15,7 @@ static uint32_t avRiKeyId;
 static unsigned short lastSeq;
 
 static bool pingThreadStarted;
-static bool receivedDataFromPeer;
+static atomic_bool receivedDataFromPeer; // Read by stopAudioStream()
 static uint64_t firstReceiveTime;
 
 #ifdef LC_DEBUG
@@ -69,10 +69,10 @@ int initializeAudioStream(void) {
     LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpaInitializeQueue(&rtpAudioQueue);
     lastSeq = 0;
-    receivedDataFromPeer = false;
+    atomic_store_explicit(&receivedDataFromPeer, false, memory_order_relaxed);
     pingThreadStarted = false;
     firstReceiveTime = 0;
-    audioDecryptionCtx = PltCreateCryptoContext();
+    audioDecryptionCtx = PltCreateCryptoContext(0);
 #ifdef LC_DEBUG
     opusHeaderByte = INVALID_OPUS_HEADER;
 #endif
@@ -175,11 +175,11 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
 
     lastSeq = rtp->sequenceNumber;
 
+    int dataLength = packet->header.size - sizeof(*rtp);
     if (AudioEncryptionEnabled) {
         // We must have room for the AES padding which may be written to the buffer
         unsigned char decryptedOpusData[ROUND_TO_PKCS7_PADDED_LEN(MAX_PACKET_SIZE)];
         unsigned char iv[16] = { 0 };
-        int dataLength = packet->header.size - sizeof(*rtp);
 
         LC_ASSERT(dataLength <= MAX_PACKET_SIZE);
 
@@ -189,13 +189,18 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
 
         memcpy(iv, &ivSeq, sizeof(ivSeq));
 
-        if (!PltDecryptMessage(audioDecryptionCtx, ALGORITHM_AES_CBC, CIPHER_FLAG_RESET_IV | CIPHER_FLAG_FINISH,
+        if (!PltDecryptMessage(audioDecryptionCtx, ALGORITHM_AES_CBC, CIPHER_FLAG_RESET_IV | CIPHER_FLAG_FINISH, 0, ivSeq,
                                (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
                                iv, sizeof(iv),
                                NULL, 0,
                                (unsigned char*)(rtp + 1), dataLength,
                                decryptedOpusData, &dataLength)) {
             Limelog("Failed to decrypt audio packet (sequence number: %u)\n", rtp->sequenceNumber);
+            LC_ASSERT_VT(false);
+            return;
+        }
+
+        if (dataLength == 0) {
             LC_ASSERT_VT(false);
             return;
         }
@@ -218,6 +223,11 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
         AudioCallbacks.decodeAndPlaySample((char*)decryptedOpusData, dataLength);
     }
     else {
+        if (dataLength == 0) {
+            LC_ASSERT_VT(false);
+            return;
+        }
+
 #ifdef LC_DEBUG
         if (opusHeaderByte == INVALID_OPUS_HEADER) {
             opusHeaderByte = ((uint8_t*)(rtp + 1))[0];
@@ -267,7 +277,8 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
 
-        packet->header.size = recvUdpSocket(rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        packet->header.size = recvUdpSocket(rtpSocket, &packet->data[0], MAX_PACKET_SIZE,
+                                            useSelect, NULL, NULL);
         if (packet->header.size < 0) {
             Limelog("Audio Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -275,8 +286,8 @@ static void AudioReceiveThreadProc(void* context) {
         }
         else if (packet->header.size == 0) {
             // Receive timed out; try again
-            
-            if (!receivedDataFromPeer) {
+
+            if (!atomic_load_explicit(&receivedDataFromPeer, memory_order_relaxed)) {
                 waitingForAudioMs += UDP_RECV_POLL_TIMEOUT_MS;
             }
             else {
@@ -294,11 +305,12 @@ static void AudioReceiveThreadProc(void* context) {
 
         rtp = (PRTP_PACKET)&packet->data[0];
 
-        if (!receivedDataFromPeer) {
-            receivedDataFromPeer = true;
+        if (!atomic_exchange_explicit(&receivedDataFromPeer, true, memory_order_relaxed)) {
             Limelog("Received first audio packet after %d ms\n", waitingForAudioMs);
 
             if (firstReceiveTime != 0) {
+                // XXX firstReceiveTime is never set here...
+                // We're already dropping 500ms of audio so this probably doesn't matter
                 packetsToDrop += (uint32_t)(PltGetMillis() - firstReceiveTime) / AudioPacketDuration;
             }
 
@@ -366,7 +378,7 @@ static void AudioReceiveThreadProc(void* context) {
                         free(queuedPacket);
                     }
                 }
-                
+
                 // Break on exit
                 if (queuedPacket != NULL) {
                     break;
@@ -374,7 +386,7 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
     }
-    
+
     if (packet != NULL) {
         free(packet);
     }
@@ -398,19 +410,19 @@ static void AudioDecoderThreadProc(void* context) {
 }
 
 void stopAudioStream(void) {
-    if (!receivedDataFromPeer) {
+    if (!atomic_load_explicit(&receivedDataFromPeer, memory_order_relaxed)) {
         Limelog("No audio traffic was ever received from the host!\n");
     }
 
     AudioCallbacks.stop();
 
     PltInterruptThread(&receiveThread);
-    if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {        
+    if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
         // Signal threads waiting on the LBQ
         LbqSignalQueueShutdown(&packetQueue);
         PltInterruptThread(&decoderThread);
     }
-    
+
     PltJoinThread(&receiveThread);
     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
         PltJoinThread(&decoderThread);
@@ -447,7 +459,6 @@ int startAudioStream(void* audioContext, int arFlags) {
     err = PltCreateThread("AudioRecv", AudioReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {
         AudioCallbacks.stop();
-        closeSocket(rtpSocket);
         AudioCallbacks.cleanup();
         return err;
     }
@@ -458,7 +469,6 @@ int startAudioStream(void* audioContext, int arFlags) {
             AudioCallbacks.stop();
             PltInterruptThread(&receiveThread);
             PltJoinThread(&receiveThread);
-            closeSocket(rtpSocket);
             AudioCallbacks.cleanup();
             return err;
         }
@@ -473,4 +483,8 @@ int LiGetPendingAudioFrames(void) {
 
 int LiGetPendingAudioDuration(void) {
     return LiGetPendingAudioFrames() * AudioPacketDuration;
+}
+
+void LiGetRTPAudioStats(PRTP_AUDIO_STATS stats) {
+    RtpaGetStats(&rtpAudioQueue, stats);
 }

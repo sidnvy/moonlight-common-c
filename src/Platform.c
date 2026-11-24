@@ -2,6 +2,15 @@
 #include "Limelight-internal.h"
 #if defined(__vita__)
 #include <pthread.h>
+#include <psp2/kernel/processmgr.h>
+#endif
+
+#ifndef HAVE_CLOCK_GETTIME
+#ifdef CLOCK_MONOTONIC
+#define HAVE_CLOCK_GETTIME 1
+#else
+#define HAVE_CLOCK_GETTIME 0
+#endif
 #endif
 
 // The maximum amount of time before observing an interrupt
@@ -14,12 +23,14 @@ struct thread_context {
     const char* name;
 };
 
-static int activeThreads = 0;
-static int activeMutexes = 0;
-static int activeEvents = 0;
-static int activeCondVars = 0;
+#ifdef LC_DEBUG
+static atomic_int activeThreads = 0;
+static atomic_int activeMutexes = 0;
+static atomic_int activeEvents = 0;
+static atomic_int activeCondVars = 0;
+#endif
 
-#if defined(LC_WINDOWS)
+#if defined(LC_WINDOWS) && !defined(NXDK)
 
 #pragma pack(push, 8)
 typedef struct tagTHREADNAME_INFO
@@ -64,18 +75,23 @@ void setThreadNameWin32(const char* name) {
     }
 #endif
 }
+#endif
 
+#if defined(LC_WINDOWS)
 DWORD WINAPI ThreadProc(LPVOID lpParameter) {
     struct thread_context* ctx = (struct thread_context*)lpParameter;
 #elif defined(__WIIU__)
 int ThreadProc(int argc, const char** argv) {
     struct thread_context* ctx = (struct thread_context*)argv;
+#elif defined (__3DS__)
+void ThreadProc(void* context) {
+    struct thread_context* ctx = (struct thread_context*)context;
 #else
 void* ThreadProc(void* context) {
     struct thread_context* ctx = (struct thread_context*)context;
 #endif
 
-#if defined(LC_WINDOWS)
+#if defined(LC_WINDOWS) && !defined(NXDK)
     setThreadNameWin32(ctx->name);
 #elif defined(__linux__) || defined(__FreeBSD__)
     pthread_setname_np(pthread_self(), ctx->name);
@@ -85,32 +101,36 @@ void* ThreadProc(void* context) {
 
     ctx->entry(ctx->context);
 
-#if defined(__vita__)
-free(ctx);
-#endif
+    free(ctx);
 
-#if defined(LC_WINDOWS) || defined(__vita__) || defined(__WIIU__) || defined(__3DS__)
+#if defined(LC_WINDOWS) || defined(__vita__) || defined(__WIIU__)
     return 0;
+#elif defined(__3DS__)
+    return;
 #else
     return NULL;
 #endif
 }
 
-void PltSleepMs(int ms) {
+void PltSleepMs(uint32_t ms) {
 #if defined(LC_WINDOWS)
     SleepEx(ms, FALSE);
 #elif defined(__3DS__)
-    s64 nsecs = ms * 1000000;
+    s64 nsecs = (s64)ms * 1000000LL;
     svcSleepThread(nsecs);
 #else
-    useconds_t usecs = ms * 1000;
-    usleep(usecs);
+    struct timespec req;
+
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+
+    while (nanosleep(&req, &req) == -1 && errno == EINTR);
 #endif
 }
 
-void PltSleepMsInterruptible(PLT_THREAD* thread, int ms) {
+void PltSleepMsInterruptible(PLT_THREAD* thread, uint32_t ms) {
     while (ms > 0 && !PltIsThreadInterrupted(thread)) {
-        int msToSleep = ms < INTERRUPT_PERIOD_MS ? ms : INTERRUPT_PERIOD_MS;
+        uint32_t msToSleep = ms < INTERRUPT_PERIOD_MS ? ms : INTERRUPT_PERIOD_MS;
         PltSleepMs(msToSleep);
         ms -= msToSleep;
     }
@@ -129,13 +149,14 @@ int PltCreateMutex(PLT_MUTEX* mutex) {
         return err;
     }
 #endif
+#ifdef LC_DEBUG
     activeMutexes++;
+#endif
     return 0;
 }
 
 void PltDeleteMutex(PLT_MUTEX* mutex) {
-    LC_ASSERT(activeMutexes > 0);
-    activeMutexes--;
+    LC_ASSERT(activeMutexes-- > 0);
 #if defined(LC_WINDOWS)
     // No-op to destroy a SRWLOCK
 #elif defined(__WIIU__) || defined(__3DS__)
@@ -157,6 +178,18 @@ void PltLockMutex(PLT_MUTEX* mutex) {
 #endif
 }
 
+bool PltTryLockMutex(PLT_MUTEX* mutex) {
+#if defined(LC_WINDOWS)
+    return TryAcquireSRWLockExclusive(mutex);
+#elif defined(__WIIU__)
+    return OSFastMutex_TryLock(mutex);
+#elif defined(__3DS__)
+    return LightLock_TryLock(mutex) == 0;
+#else
+    return pthread_mutex_trylock(mutex) == 0;
+#endif
+}
+
 void PltUnlockMutex(PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     ReleaseSRWLockExclusive(mutex);
@@ -170,8 +203,7 @@ void PltUnlockMutex(PLT_MUTEX* mutex) {
 }
 
 void PltJoinThread(PLT_THREAD* thread) {
-    LC_ASSERT(activeThreads > 0);
-    activeThreads--;
+    LC_ASSERT(activeThreads-- > 0);
 
 #if defined(LC_WINDOWS)
     WaitForSingleObjectEx(thread->handle, INFINITE, FALSE);
@@ -187,8 +219,7 @@ void PltJoinThread(PLT_THREAD* thread) {
 }
 
 void PltDetachThread(PLT_THREAD* thread) {
-    LC_ASSERT(activeThreads > 0);
-    activeThreads--;
+    LC_ASSERT(activeThreads-- > 0);
 
 #if defined(LC_WINDOWS)
     // According MSDN:
@@ -204,11 +235,11 @@ void PltDetachThread(PLT_THREAD* thread) {
 }
 
 bool PltIsThreadInterrupted(PLT_THREAD* thread) {
-    return thread->cancelled;
+    return atomic_load_explicit(&thread->cancelled, memory_order_acquire);
 }
 
 void PltInterruptThread(PLT_THREAD* thread) {
-    thread->cancelled = true;
+    atomic_store_explicit(&thread->cancelled, true, memory_order_release);
 }
 
 #ifdef __WIIU__
@@ -287,27 +318,32 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
 
         pthread_attr_init(&attr);
 
+#ifdef __vita__
         pthread_attr_setstacksize(&attr, 0x100000);
+#endif
 
         ctx->name = name;
 
         int err = pthread_create(&thread->thread, &attr, ThreadProc, ctx);
+        pthread_attr_destroy(&attr);
         if (err != 0) {
             free(ctx);
             return err;
         }
-        
+
     }
 #endif
 
+#ifdef LC_DEBUG
     activeThreads++;
+#endif
 
     return 0;
 }
 
 int PltCreateEvent(PLT_EVENT* event) {
 #if defined(LC_WINDOWS)
-    *event = CreateEventEx(NULL, NULL, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
+    *event = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!*event) {
         return -1;
     }
@@ -321,13 +357,14 @@ int PltCreateEvent(PLT_EVENT* event) {
     }
     event->signalled = false;
 #endif
+#ifdef LC_DEBUG
     activeEvents++;
+#endif
     return 0;
 }
 
 void PltCloseEvent(PLT_EVENT* event) {
-    LC_ASSERT(activeEvents > 0);
-    activeEvents--;
+    LC_ASSERT(activeEvents-- > 0);
 #if defined(LC_WINDOWS)
     CloseHandle(*event);
 #else
@@ -343,7 +380,7 @@ void PltSetEvent(PLT_EVENT* event) {
     PltLockMutex(&event->mutex);
     event->signalled = true;
     PltUnlockMutex(&event->mutex);
-    PltSignalConditionVariable(&event->cond);
+    PltBroadcastConditionVariable(&event->cond);
 #endif
 }
 
@@ -351,7 +388,9 @@ void PltClearEvent(PLT_EVENT* event) {
 #if defined(LC_WINDOWS)
     ResetEvent(*event);
 #else
+    PltLockMutex(&event->mutex);
     event->signalled = false;
+    PltUnlockMutex(&event->mutex);
 #endif
 }
 
@@ -377,13 +416,14 @@ int PltCreateConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 #else
     pthread_cond_init(cond, NULL);
 #endif
+#ifdef LC_DEBUG
     activeCondVars++;
+#endif
     return 0;
 }
 
 void PltDeleteConditionVariable(PLT_COND* cond) {
-    LC_ASSERT(activeCondVars > 0);
-    activeCondVars--;
+    LC_ASSERT(activeCondVars-- > 0);
 #if defined(LC_WINDOWS)
     // No-op to delete a CONDITION_VARIABLE
 #elif defined(__WIIU__)
@@ -407,6 +447,19 @@ void PltSignalConditionVariable(PLT_COND* cond) {
 #endif
 }
 
+void PltBroadcastConditionVariable(PLT_COND* cond) {
+#if defined(LC_WINDOWS)
+    WakeAllConditionVariable(cond);
+#elif defined(__WIIU__)
+    // FIXME: This only wakes one thread
+    OSFastCond_Signal(cond);
+#elif defined(__3DS__)
+    CondVar_Broadcast(cond);
+#else
+    pthread_cond_broadcast(cond);
+#endif
+}
+
 void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     SleepConditionVariableSRW(cond, mutex, INFINITE, 0);
@@ -419,23 +472,146 @@ void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 #endif
 }
 
-uint64_t PltGetMillis(void) {
-#if defined(LC_WINDOWS)
-    return GetTickCount64();
-#elif defined(CLOCK_MONOTONIC) && !defined(NO_CLOCK_GETTIME)
-    struct timespec tv;
+//// Begin timing functions
 
-    clock_gettime(CLOCK_MONOTONIC, &tv);
+// These functions return a number of microseconds or milliseconds since an opaque start time.
 
-    return ((uint64_t)tv.tv_sec * 1000) + (tv.tv_nsec / 1000000);
-#else
-    struct timeval tv;
+#define TICKS_INIT_NOT_STARTED 0
+#define TICKS_INIT_IN_PROGRESS 1
+#define TICKS_INIT_COMPLETED 2
 
-    gettimeofday(&tv, NULL);
+static atomic_int ticks_init_state = TICKS_INIT_NOT_STARTED;
 
-    return ((uint64_t)tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-#endif
+static void PltTicksInitInternal(void);
+
+void PltTicksInit(void) {
+    if (atomic_load_explicit(&ticks_init_state, memory_order_acquire) == TICKS_INIT_COMPLETED) {
+        return;
+    }
+
+    int expected = TICKS_INIT_NOT_STARTED;
+    if (atomic_compare_exchange_strong_explicit(&ticks_init_state, &expected,
+            TICKS_INIT_IN_PROGRESS, memory_order_acq_rel, memory_order_acquire)) {
+        PltTicksInitInternal();
+        atomic_store_explicit(&ticks_init_state, TICKS_INIT_COMPLETED, memory_order_release);
+    }
+    else {
+        while (atomic_load_explicit(&ticks_init_state, memory_order_acquire) != TICKS_INIT_COMPLETED) {
+            PltSleepMs(1);
+        }
+    }
 }
+
+#if defined(LC_WINDOWS)
+
+static LARGE_INTEGER start_ticks;
+static LARGE_INTEGER ticks_per_second;
+
+static void PltTicksInitInternal(void) {
+    QueryPerformanceFrequency(&ticks_per_second);
+    QueryPerformanceCounter(&start_ticks);
+}
+
+uint64_t PltGetMicroseconds(void) {
+    if (atomic_load_explicit(&ticks_init_state, memory_order_acquire) != TICKS_INIT_COMPLETED) {
+        PltTicksInit();
+    }
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    int64_t elapsed = now.QuadPart - start_ticks.QuadPart;
+    int64_t freq = ticks_per_second.QuadPart;
+
+    return (uint64_t)((elapsed / freq) * 1000000 + ((elapsed % freq) * 1000000) / freq);
+}
+
+#elif defined(__vita__)
+
+static uint64_t start;
+
+static void PltTicksInitInternal(void) {
+    start = sceKernelGetProcessTimeWide();
+}
+
+uint64_t PltGetMicroseconds(void) {
+    if (atomic_load_explicit(&ticks_init_state, memory_order_acquire) != TICKS_INIT_COMPLETED) {
+        PltTicksInit();
+    }
+    uint64_t now = sceKernelGetProcessTimeWide();
+    return (uint64_t)(now - start);
+}
+
+#elif defined(__3DS__)
+
+static uint64_t start;
+
+static void PltTicksInitInternal(void) {
+    start = svcGetSystemTick();
+}
+
+uint64_t PltGetMicroseconds(void) {
+    if (atomic_load_explicit(&ticks_init_state, memory_order_acquire) != TICKS_INIT_COMPLETED) {
+        PltTicksInit();
+    }
+    uint64_t elapsed = svcGetSystemTick() - start;
+    return elapsed * 1000 / CPU_TICKS_PER_MSEC;
+}
+
+#else
+
+/* Use CLOCK_MONOTONIC_RAW, if available, which is not subject to adjustment by NTP */
+#if HAVE_CLOCK_GETTIME
+static struct timespec start_ts;
+# ifdef CLOCK_MONOTONIC_RAW
+#  define PLT_MONOTONIC_CLOCK CLOCK_MONOTONIC_RAW
+# else
+#  define PLT_MONOTONIC_CLOCK CLOCK_MONOTONIC
+# endif
+#endif
+
+static bool has_monotonic_time = false;
+static struct timeval start_tv;
+
+static void PltTicksInitInternal(void) {
+#if HAVE_CLOCK_GETTIME
+    if (clock_gettime(PLT_MONOTONIC_CLOCK, &start_ts) == 0) {
+        has_monotonic_time = true;
+    } else
+#endif
+    {
+        gettimeofday(&start_tv, NULL);
+    }
+}
+
+uint64_t PltGetMicroseconds(void) {
+    if (atomic_load_explicit(&ticks_init_state, memory_order_acquire) != TICKS_INIT_COMPLETED) {
+        PltTicksInit();
+    }
+
+    if (has_monotonic_time) {
+#if HAVE_CLOCK_GETTIME
+        struct timespec now;
+        clock_gettime(PLT_MONOTONIC_CLOCK, &now);
+        return (uint64_t)(((int64_t)(now.tv_sec - start_ts.tv_sec) * 1000000) + ((now.tv_nsec - start_ts.tv_nsec) / 1000));
+#else
+        LC_ASSERT(false);
+        return 0;
+#endif
+    } else {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        return (uint64_t)(((int64_t)(now.tv_sec - start_tv.tv_sec) * 1000000) + (now.tv_usec - start_tv.tv_usec));
+    }
+}
+
+#endif
+
+uint64_t PltGetMillis(void) {
+    return PltGetMicroseconds() / 1000;
+}
+
+//// End timing functions
 
 bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src) {
     LC_ASSERT(dest_size > 0);
@@ -446,7 +622,7 @@ bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src) {
     memset(dest, 0xFE, dest_size);
 #endif
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(NXDK)
     // strncpy_s() with _TRUNCATE does what we need for MSVC.
     // We use this rather than strcpy_s() because we don't want
     // the invalid parameter handler invoked upon failure.
@@ -473,6 +649,8 @@ bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src) {
 
 int initializePlatform(void) {
     int err;
+
+    PltTicksInit();
 
     err = initializePlatformSockets();
     if (err != 0) {

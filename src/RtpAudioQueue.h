@@ -2,7 +2,9 @@
 
 #include "Video.h"
 
-#include "rs.h"
+#include <stdatomic.h>
+
+typedef struct _reed_solomon reed_solomon;
 
 // Maximum time to wait for an OOS data/FEC shard
 // after the entire FEC block should have been received
@@ -33,7 +35,7 @@ typedef struct _RTPA_FEC_BLOCK {
 
     AUDIO_FEC_HEADER fecHeader;
 
-    uint64_t queueTimeMs;
+    uint64_t queueTimeUs;
     uint8_t dataShardsReceived;
     uint8_t fecShardsReceived;
     bool fullyReassembled;
@@ -46,6 +48,16 @@ typedef struct _RTPA_FEC_BLOCK {
 
     // Data for shards comes here
 } RTPA_FEC_BLOCK, *PRTPA_FEC_BLOCK;
+
+typedef struct _RTP_AUDIO_QUEUE_STATS {
+    atomic_uint packetCountAudio;
+    atomic_uint packetCountFec;
+    atomic_uint packetCountFecRecovered;
+    atomic_uint packetCountFecFailed;
+    atomic_uint packetCountOOS;
+    atomic_uint packetCountInvalid;
+    atomic_uint packetCountFecInvalid;
+} RTP_AUDIO_QUEUE_STATS, *PRTP_AUDIO_QUEUE_STATS;
 
 typedef struct _RTP_AUDIO_QUEUE {
     PRTPA_FEC_BLOCK blockHead;
@@ -63,6 +75,8 @@ typedef struct _RTP_AUDIO_QUEUE {
     bool receivedOosData;
     bool synchronizing;
     bool incompatibleServer;
+
+    RTP_AUDIO_QUEUE_STATS stats;
 } RTP_AUDIO_QUEUE, *PRTP_AUDIO_QUEUE;
 
 #define RTPQ_RET_PACKET_CONSUMED 0x1
@@ -77,3 +91,4 @@ void RtpaInitializeQueue(PRTP_AUDIO_QUEUE queue);
 void RtpaCleanupQueue(PRTP_AUDIO_QUEUE queue);
 int RtpaAddPacket(PRTP_AUDIO_QUEUE queue, PRTP_PACKET packet, uint16_t length);
 PRTP_PACKET RtpaGetQueuedPacket(PRTP_AUDIO_QUEUE queue, uint16_t customHeaderLength, uint16_t* length);
+void RtpaGetStats(PRTP_AUDIO_QUEUE queue, PRTP_AUDIO_STATS stats);
