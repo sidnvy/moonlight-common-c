@@ -1,5 +1,6 @@
 #include "Limelight-internal.h"
 #include "Mic.h"
+#include "StreamDesk.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -95,9 +96,30 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            char* utf8Text;
+            uint32_t length;
+            uint64_t contentHash;
+            uint8_t flags;
+        } clipboard;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
+
+static uint32_t pendingClipboardEventId;
+static uint64_t pendingClipboardHash;
+static uint8_t pendingClipboardFlags;
+static char* pendingClipboardBuf;
+static uint32_t pendingClipboardLen;
+
+static void resetPendingClipboardState(void) {
+    free(pendingClipboardBuf);
+    pendingClipboardBuf = NULL;
+    pendingClipboardLen = 0;
+    pendingClipboardEventId = 0;
+    pendingClipboardHash = 0;
+    pendingClipboardFlags = 0;
+}
 
 static SOCKET ctlSock = INVALID_SOCKET;
 static ENetHost* client;
@@ -159,6 +181,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_CLIPBOARD 13
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 14
 #define IDX_DS_ADAPTIVE_TRIGGERS 15
+#define IDX_CLIPBOARD_EVENT 16
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -398,6 +421,7 @@ int initializeControlStream(void) {
     decryptionCtx = PltCreateCryptoContext(CTRL_CHANNEL_COUNT);
     atomic_store_explicit(&hdrEnabled, false, memory_order_relaxed);
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
+    resetPendingClipboardState();
 
     return 0;
 }
@@ -412,15 +436,32 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
     }
 }
 
+static void freeAsyncCallbackList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+    PLINKED_BLOCKING_QUEUE_ENTRY nextEntry;
+
+    while (entry != NULL) {
+        PQUEUED_ASYNC_CALLBACK cb = (PQUEUED_ASYNC_CALLBACK)entry->data;
+        nextEntry = entry->flink;
+        if (cb != NULL) {
+            if (cb->typeIndex == IDX_CLIPBOARD_EVENT) {
+                free(cb->data.clipboard.utf8Text);
+            }
+            free(cb);
+        }
+        entry = nextEntry;
+    }
+}
+
 // Cleans up control stream
 void destroyControlStream(void) {
     LC_ASSERT(stopping);
+    resetPendingClipboardState();
     PltDestroyCryptoContext(encryptionCtx);
     PltDestroyCryptoContext(decryptionCtx);
     PltCloseEvent(&idrFrameRequiredEvent);
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&referenceFrameControlQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
-    freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
+    freeAsyncCallbackList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&hdrMutex);
     PltDeleteMutex(&enetMutex);
@@ -1218,6 +1259,16 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_CLIPBOARD_EVENT:
+            if (ListenerCallbacks.clipboardText != NULL && queuedCb->data.clipboard.utf8Text != NULL) {
+                ListenerCallbacks.clipboardText(queuedCb->data.clipboard.utf8Text,
+                                                queuedCb->data.clipboard.length,
+                                                queuedCb->data.clipboard.contentHash,
+                                                queuedCb->data.clipboard.flags);
+            }
+            free(queuedCb->data.clipboard.utf8Text);
+            queuedCb->data.clipboard.utf8Text = NULL;
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1531,8 +1582,69 @@ static void controlReceiveThreadFunc(void* context) {
                 PltUnlockMutex(&hdrMutex);
             }
 
+            // Process Stream-Desk host->client clipboard events before single-packet async dispatch
+            if (ctlHdr->type == SS_CLIPBOARD_EVENT_PTYPE) {
+                SS_CLIPBOARD_EVENT_HEADER hdr;
+                const char* chunk = NULL;
+                int payloadLen = packetLength - (int)sizeof(*ctlHdr);
+
+                if (LiUnpackClipboardEventHeader((const uint8_t*)(ctlHdr + 1), payloadLen, &hdr, &chunk) &&
+                    hdr.origin == SS_CLIPBOARD_ORIGIN_HOST) {
+                    if (pendingClipboardBuf == NULL || pendingClipboardEventId != hdr.eventId) {
+                        resetPendingClipboardState();
+                        pendingClipboardEventId = hdr.eventId;
+                        pendingClipboardHash = hdr.contentHash;
+                        pendingClipboardFlags = hdr.flags;
+                    }
+
+                    if (pendingClipboardLen + hdr.payloadLength <= LI_STREAM_DESK_MAX_TEXT_BYTES) {
+                        if (hdr.payloadLength > 0) {
+                            char* grown = realloc(pendingClipboardBuf, pendingClipboardLen + hdr.payloadLength + 1);
+                            if (grown != NULL) {
+                                pendingClipboardBuf = grown;
+                                memcpy(pendingClipboardBuf + pendingClipboardLen, chunk, hdr.payloadLength);
+                                pendingClipboardLen += hdr.payloadLength;
+                            } else {
+                                resetPendingClipboardState();
+                            }
+                        }
+
+                        pendingClipboardFlags |= hdr.flags;
+
+                        if ((hdr.flags & SS_CLIPBOARD_FLAG_FINAL) != 0) {
+                            if (pendingClipboardBuf != NULL && pendingClipboardLen > 0) {
+                                PQUEUED_ASYNC_CALLBACK queuedCb = calloc(1, sizeof(*queuedCb));
+                                if (queuedCb != NULL) {
+                                    pendingClipboardBuf[pendingClipboardLen] = '\0';
+                                    queuedCb->typeIndex = IDX_CLIPBOARD_EVENT;
+                                    queuedCb->data.clipboard.utf8Text = pendingClipboardBuf;
+                                    queuedCb->data.clipboard.length = pendingClipboardLen;
+                                    queuedCb->data.clipboard.contentHash = pendingClipboardHash;
+                                    queuedCb->data.clipboard.flags = pendingClipboardFlags;
+                                    pendingClipboardBuf = NULL;
+                                    pendingClipboardLen = 0;
+                                    pendingClipboardEventId = 0;
+                                    pendingClipboardHash = 0;
+                                    pendingClipboardFlags = 0;
+
+                                    if (LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry) != LBQ_SUCCESS) {
+                                        free(queuedCb->data.clipboard.utf8Text);
+                                        free(queuedCb);
+                                    }
+                                } else {
+                                    resetPendingClipboardState();
+                                }
+                            } else {
+                                resetPendingClipboardState();
+                            }
+                        }
+                    } else {
+                        resetPendingClipboardState();
+                    }
+                }
+            }
             // Process client callbacks in a separate thread
-            if (needsAsyncCallback(ctlHdr->type)) {
+            else if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
@@ -2382,4 +2494,34 @@ int sendMicPacketOnControlStream(const void* data, int length) {
         ENET_PACKET_FLAG_UNSEQUENCED,
         false
     ) ? 0 : -1;
+}
+
+bool sendCommitTextPacketOnControlStream(const uint8_t* payload, unsigned int length) {
+    if (payload == NULL || length == 0) {
+        return false;
+    }
+
+    return sendMessageAndForget(
+        SS_COMMIT_TEXT_PTYPE,
+        length,
+        payload,
+        CTRL_CHANNEL_KEYBOARD,
+        ENET_PACKET_FLAG_RELIABLE,
+        false
+    );
+}
+
+bool sendClipboardEventPacketOnControlStream(const uint8_t* payload, unsigned int length) {
+    if (payload == NULL || length == 0) {
+        return false;
+    }
+
+    return sendMessageAndForget(
+        SS_CLIPBOARD_EVENT_PTYPE,
+        length,
+        payload,
+        CTRL_CHANNEL_SERVERCTL,
+        ENET_PACKET_FLAG_RELIABLE,
+        false
+    );
 }

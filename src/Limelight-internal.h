@@ -90,8 +90,12 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 #define ML_FF_MIC_INPUT 0x04 // Client supports reverse microphone uplink
+#define ML_FF_COMMIT_TEXT 0x08 // Client supports control-channel COMMIT_TEXT
+#define ML_FF_CLIPBOARD_EVENT 0x10 // Client supports event-driven CLIPBOARD_EVENT
 
 int sendMicPacketOnControlStream(const void* data, int length);
+bool sendCommitTextPacketOnControlStream(const uint8_t* payload, unsigned int length);
+bool sendClipboardEventPacketOnControlStream(const uint8_t* payload, unsigned int length);
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 

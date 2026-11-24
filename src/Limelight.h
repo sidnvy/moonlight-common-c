@@ -491,6 +491,9 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// This callback is invoked when the host pushes updated clipboard text over Control Channel v1.
+typedef void(*ConnListenerClipboardText)(const char* utf8Text, uint32_t length, uint64_t contentHash, uint8_t flags);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -505,6 +508,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerClipboardText clipboardText;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1033,6 +1037,8 @@ void LiRequestIdrFrame(void);
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
 #define LI_FF_MIC_INPUT               0x0100 // LiSendMicAudioFrame() supported
+#define LI_FF_COMMIT_TEXT             0x0200 // LiSendCommitText() supported
+#define LI_FF_CLIPBOARD_EVENT         0x0400 // LiSendClipboardText()/ConnListenerClipboardText supported
 uint32_t LiGetHostFeatureFlags(void);
 
 // Reverse microphone uplink parameters (48 kHz mono Opus, 20 ms frames)
@@ -1044,6 +1050,14 @@ uint32_t LiGetHostFeatureFlags(void);
 // Sends one Opus-encoded microphone frame over the encrypted control stream.
 // timestampSamples must be an independent monotonic sample counter (not seqNumber * 960).
 int LiSendMicAudioFrame(const unsigned char* opusData, int opusLength, uint16_t seqNumber, uint32_t timestampSamples);
+
+// Stream-Desk atomic text commit & event-driven clipboard sync limits/flags
+#define LI_STREAM_DESK_MAX_TEXT_BYTES 65536
+#define LI_CLIPBOARD_FLAG_SENSITIVE   0x02
+
+uint64_t LiComputeClipboardHash(const char* utf8Text, uint32_t length);
+int LiSendCommitText(const char* utf8Text, uint32_t length);
+int LiSendClipboardText(const char* utf8Text, uint32_t length, uint8_t flags);
 
 #ifdef __cplusplus
 }
