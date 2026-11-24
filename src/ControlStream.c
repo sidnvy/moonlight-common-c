@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "Mic.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -2366,4 +2367,19 @@ int LiSendEmptyPayload() {
         ENET_PACKET_FLAG_RELIABLE,
         false
     );
+}
+
+int sendMicPacketOnControlStream(const void* data, int length) {
+    if (data == NULL || length <= 0) {
+        return -1;
+    }
+
+    return sendMessageAndForget(
+        SS_MIC_OPUS_PTYPE,
+        (unsigned int)length,
+        data,
+        CTRL_CHANNEL_GENERIC,
+        ENET_PACKET_FLAG_UNSEQUENCED,
+        false
+    ) ? 0 : -1;
 }

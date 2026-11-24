@@ -1032,7 +1032,18 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_MIC_INPUT               0x0100 // LiSendMicAudioFrame() supported
 uint32_t LiGetHostFeatureFlags(void);
+
+// Reverse microphone uplink parameters (48 kHz mono Opus, 20 ms frames)
+#define LI_MIC_SAMPLE_RATE    48000
+#define LI_MIC_CHANNELS       1
+#define LI_MIC_FRAME_SAMPLES  960
+#define LI_MIC_MAX_OPUS_BYTES 1500
+
+// Sends one Opus-encoded microphone frame over the encrypted control stream.
+// timestampSamples must be an independent monotonic sample counter (not seqNumber * 960).
+int LiSendMicAudioFrame(const unsigned char* opusData, int opusLength, uint16_t seqNumber, uint32_t timestampSamples);
 
 #ifdef __cplusplus
 }
